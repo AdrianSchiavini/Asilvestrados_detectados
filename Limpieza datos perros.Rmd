@@ -1,0 +1,97 @@
+---
+title: "Limpieza datos perros cámaras trampa par aíndice"
+output:
+  pdf_document: default
+  html_document: default
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1. Carga de librerías y datos
+
+Cargamos `tidyverse` e importamos `perroscluster.csv` y `cameraOperation.csv`. 
+*(Nota: Si los archivos originales usan `;` como separador en lugar de `,`, cambia `read_csv` por `read_csv2`).*
+
+```{r carga-datos}
+library(tidyverse)
+
+# Lectura de archivos originales
+perros_raw <- read_csv2("perroscluster.csv") %>%
+  mutate(DateTimeOriginal = ymd_hms(DateTimeOriginal))
+cam_op_raw <- read_csv("cameraOperation.csv") %>%
+  rename(Station = `...1` )
+
+```
+
+## 2. Filtrado de registros en `perroscluster.csv`
+
+Filtramos por la especie *Canis lupus familiaris*, obtenemos los registros únicos combinando `Station` y `DateTimeOriginal`, y conservamos únicamente esas dos variables.
+
+```{r filtrado-perros}
+perros_filtrado <- perros_raw %>%
+  distinct(Station, DateTimeOriginal) %>%
+  select(Station, DateTimeOriginal)
+```
+
+## 3. Correspondencia de `Station` a `"Cámara X"`
+
+Creamos un diccionario único con todas las estaciones presentes en ambos archivos para que cada `Station` tenga exactamente el mismo correlato (`"Cámara 1"`, `"Cámara 2"`, ..., `"Cámara X"`) en las dos tablas.
+
+```{r diccionario-estaciones}
+# Extraer estaciones únicas combinadas sin valores NA
+estaciones_unicas <- unique(c(perros_filtrado$Station, cam_op_raw$Station))
+estaciones_unicas <- estaciones_unicas[!is.na(estaciones_unicas)]
+
+# Generar tabla de equivalencias
+diccionario_camaras <- tibble(
+  Station = estaciones_unicas,
+  Nueva_Station = paste("Cámara", seq_along(estaciones_unicas))
+)
+
+# Mostrar tabla de correspondencia
+print(diccionario_camaras, n = Inf)
+```
+
+## 4. Reemplazo en ambas bases de datos
+
+Sustituimos los nombres originales de `Station` por su etiqueta `"Cámara X"` correspondiente en ambos conjuntos de datos.
+
+```{r reemplazo-estaciones}
+
+
+# Definir el listado permitido de estaciones (Cámara 1 a Cámara 20)
+camaras_permitidas <- paste("Cámara", 1:20)
+
+# 1. Reemplazo y filtrado en perroscluster
+perros_final <- perros_filtrado %>%
+  left_join(diccionario_camaras, by = "Station") %>%
+  mutate(Station = Nueva_Station) %>%
+  filter(Station %in% camaras_permitidas) %>%
+  select(Station, DateTimeOriginal)
+
+# 2. Reemplazo y filtrado en cameraOperation (conservando todas sus columnas originales)
+cam_op_final <- cam_op_raw %>%
+  left_join(diccionario_camaras, by = "Station") %>%
+  mutate(Station = Nueva_Station) %>%
+  filter(Station %in% camaras_permitidas) %>%
+  select(-Nueva_Station)
+```
+
+## 5. Exportación de resultados
+
+Guardamos `Perroscámaras.csv` delimitado por punto y coma (`;`) y `cameraOperation.csv` en su formato estándar.
+
+```{r exportar-archivos}
+# Guardar perroscluster filtrado delimitado por ";"
+write_excel_csv(perros_final, "Perroscámaras.csv")
+
+# Guardar cameraOperation.csv como tal
+# write_csv2(cam_op_final, file = "cameraOperation.csv")
+write_excel_csv(cam_op_final, "cam_op_final.csv")
+```
+
+
+

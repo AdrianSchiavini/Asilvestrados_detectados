@@ -1,0 +1,555 @@
+---
+title: "Tendencia del índice de actividad de perros asilvestrados"
+subtitle: "Modelo de referencia y productos de monitoreo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+  word_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 5.5, dpi = 150)
+```
+
+Rutina de análisis de la tendencia temporal del índice de actividad (eventos
+independientes por 1.000 días-cámara). Implementa un único modelo de referencia —GLMM
+binomial negativa con *offset* de esfuerzo, estacionalidad armónica, intercepto aleatorio
+por cámara y estructura AR(1) mensual— y los cuatro productos que se derivan de él:
+
+1. la estimación formal de la tendencia (la cifra del informe);
+2. el índice anual modelo-basado con IC95% (el producto de comunicación);
+3. el ordenamiento de cámaras por nivel y por velocidad de cambio (para asignar esfuerzo de control);
+4. el análisis de derivadas del GAM (para evaluar intervenciones puntuales).
+
+```{r librerias}
+library(tidyverse)
+library(lubridate)
+library(glmmTMB)
+library(mgcv)
+library(DHARMa)
+library(emmeans)
+library(patchwork)
+
+select <- dplyr::select   # MASS u otros paquetes pueden enmascarar select()
+theme_set(theme_minimal(base_size = 13))
+```
+
+# Parámetros de la corrida
+
+Lo único que hay que tocar al actualizar la base.
+
+```{r parametros}
+ARCHIVO_REGISTROS <- "Perroscámaras.csv"      # tabla de registros (camtrapR)
+ARCHIVO_CAMOP     <- "cameraOperation.csv"    # matriz de operación exportada de camtrapR
+# Especie a analizar. Se ignora si la tabla no trae columna Species (caso de las
+# tablas ya filtradas y reducidas a dos columnas).
+ESPECIE           <- "Canis lupus familiaris"
+ESCALA            <- 1000                     # eventos por 1.000 días-cámara
+# La ventana de estudio NO se fija a mano: se deduce del alcance de la tabla de
+# registros (chunk `carga`). La matriz de operación se recorta a esas estaciones
+# y a esas fechas, porque el esfuerzo que queda fuera corresponde a cámaras o a
+# fechas cuyas fotografías no fueron procesadas y entraría como ceros falsos.
+```
+
+# Datos y esfuerzo
+
+El índice se calcula sobre **eventos fotográficos independientes**, no sobre filas de la
+tabla: las filas expandidas por número de individuos (`tipo_registro`) se excluyen y el
+resto se reduce a combinaciones únicas de `Station` y `DateTimeOriginal`.
+
+La ventana de estudio se deduce de los datos: la matriz de operación se recorta a las
+estaciones presentes en la tabla de registros y a los días comprendidos entre el primer y
+el último evento. El esfuerzo que queda fuera corresponde a cámaras o a fechas cuyas
+fotografías no fueron procesadas; incorporarlo equivaldría a declarar ceros donde no hubo
+observación. El chunk de carga informa cuánto se recortó en cada corrida.
+
+```{r carga}
+# Lectura robusta: detecta el separador y reduce las filas a EVENTOS INDEPENDIENTES.
+# Estas tablas traen una fila por individuo y por archivo de imagen: un grupo de nueve
+# perros puede ocupar dieciocho filas con la misma Station y DateTimeOriginal. Contar
+# filas sobrestima el índice y, como el tamaño medio de grupo cambia en el tiempo
+# (de ~1,45 filas por evento en 2020 a ~2,40 en 2025), introduce tendencia espuria.
+# Lee un csv detectando el separador: las exportaciones de camtrapR varían entre
+# coma y punto y coma según la configuración regional.
+leer_csv <- function(archivo) {
+  sep <- if (str_detect(read_lines(archivo, n_max = 1), ";")) ";" else ","
+  if (sep == ";") read_csv2(archivo, show_col_types = FALSE)
+  else read_csv(archivo, show_col_types = FALSE, guess_max = 50000)
+}
+
+# Interpreta la fecha probando los formatos habituales y quedándose con el que
+# deja menos valores sin convertir: ISO (2023-10-04 11:30:25) y día/mes/año
+# (4/10/2023 11:30) conviven entre exportaciones.
+parsear_fecha <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as_date(x))
+  s <- as.character(x)
+  cand <- suppressWarnings(list(
+    as_date(ymd_hms(s, quiet = TRUE)), as_date(ymd(s, quiet = TRUE)),
+    as_date(dmy_hms(s, quiet = TRUE)), as_date(dmy_hm(s, quiet = TRUE)),
+    as_date(dmy(s, quiet = TRUE))))
+  faltan <- vapply(cand, function(z) sum(is.na(z)), integer(1))
+  if (min(faltan) > 0.05 * length(s))
+    warning("Más del 5% de las fechas no se pudo interpretar.", call. = FALSE)
+  cand[[which.min(faltan)]]
+}
+
+leer_registros <- function(archivo, especie = NULL) {
+  x <- leer_csv(archivo)
+  stopifnot(all(c("Station", "DateTimeOriginal") %in% names(x)))
+
+  # El filtro de especie sólo aplica si la tabla trae esa columna
+  if (!is.null(especie) && "Species" %in% names(x)) x <- filter(x, Species == especie)
+
+  x <- mutate(x, fecha_ev = parsear_fecha(DateTimeOriginal))
+  n0 <- nrow(x)
+
+  # 1) descartar filas expandidas por número de individuos
+  if ("tipo_registro" %in% names(x)) x <- filter(x, is.na(tipo_registro))
+  n1 <- nrow(x)
+
+  # 2) un evento = una combinación Station + DateTimeOriginal
+  x <- distinct(x, Station, DateTimeOriginal, .keep_all = TRUE)
+
+  cat("Filas leídas:", n0,
+      "| tras excluir filas generadas por conteo:", n1,
+      "| eventos independientes:", nrow(x), "\n")
+  x
+}
+
+# Matriz de operación: la primera columna es la estación, tenga nombre o no.
+# Los valores pueden ser fraccionarios (0,5) cuando una estación tiene más de
+# una cámara y sólo parte de ellas estuvo operativa ese día.
+leer_camop_largo <- function(archivo) {
+  camop <- leer_csv(archivo)
+  names(camop)[1] <- "Station"
+  camop %>%
+    pivot_longer(-Station, names_to = "fecha", values_to = "Valor") %>%
+    mutate(fecha = as_date(fecha), Valor = as.numeric(Valor)) %>%
+    filter(!is.na(fecha))
+}
+
+registros   <- leer_registros(ARCHIVO_REGISTROS, ESPECIE)
+camop_crudo <- leer_camop_largo(ARCHIVO_CAMOP)
+
+# --- Alcance de la tabla de registros -------------------------------------
+# La ventana queda definida por el primer y el último evento, y la matriz de
+# operación se recorta a las estaciones que figuran en los registros. Lo que
+# queda fuera es esfuerzo sin fotografías procesadas: no son ceros, es ausencia
+# de dato. Conviene tener en cuenta que el criterio usa el primer y el último
+# EVENTO, que pueden caer después del primer día procesado y antes del último;
+# si se procesaron días sin detecciones en los extremos, esos ceros legítimos
+# quedan afuera. Para conservarlos, reemplazar VENTANA_INI / VENTANA_FIN por las
+# fechas reales de procesamiento, y quitar `Station %in% EST_REG` del filtro.
+EST_REG     <- unique(as.character(registros$Station))
+VENTANA_INI <- min(registros$fecha_ev, na.rm = TRUE)
+VENTANA_FIN <- max(registros$fecha_ev, na.rm = TRUE)
+
+camop_largo <- camop_crudo %>%
+  filter(Station %in% EST_REG, fecha >= VENTANA_INI, fecha <= VENTANA_FIN)
+stopifnot(nrow(camop_largo) > 0)
+
+cat("Matriz de operación: ", n_distinct(camop_crudo$Station), " estaciones, ",
+    format(min(camop_crudo$fecha)), " a ", format(max(camop_crudo$fecha)),
+    " (", round(sum(camop_crudo$Valor, na.rm = TRUE)), " días-cámara)\n",
+    "Recortada al alcance de los registros: ", n_distinct(camop_largo$Station),
+    " estaciones, ", format(VENTANA_INI), " a ", format(VENTANA_FIN),
+    " (", round(sum(camop_largo$Valor, na.rm = TRUE)), " días-cámara)\n", sep = "")
+
+perros <- registros %>%
+  mutate(Mes = floor_date(fecha_ev, "month"))
+
+cat("Registros de", ESPECIE, ":", nrow(perros),
+    "| Estaciones con registros:", n_distinct(perros$Station),
+    "| Rango:", format(min(perros$fecha_ev)),
+    "a", format(max(perros$fecha_ev)), "\n")
+```
+
+```{r esfuerzo}
+# Esfuerzo POR ESTACIÓN y mes. pivot_longer(-Station) no depende del número de
+# columnas, de modo que la rutina sigue funcionando al agregar fechas nuevas.
+esfuerzo <- camop_largo %>%          # ya recortado al alcance de los registros
+  mutate(Mes = floor_date(fecha, "month")) %>%
+  group_by(Station, Mes) %>%
+  summarise(esfuerzo = sum(Valor, na.rm = TRUE), .groups = "drop")
+```
+
+```{r grilla}
+# La grilla parte del esfuerzo y le pega los eventos: las celdas con cámara
+# operativa y sin perros entran como cero verdadero.
+dat <- esfuerzo %>%
+  filter(esfuerzo > 0) %>%
+  left_join(count(perros, Station, Mes, name = "eventos"), by = c("Station", "Mes")) %>%
+  mutate(eventos = replace_na(eventos, 0)) %>%
+  mutate(
+    Station = factor(Station),
+    log_esf = log(esfuerzo),
+    t_mes   = as.integer(round(interval(min(Mes), Mes) / months(1))),
+    t_anios = t_mes / 12,
+    mes_num = month(Mes),
+    anio    = year(Mes),
+    indice  = eventos / esfuerzo * ESCALA,
+    # armónicos: ciclo anual (k=1) y semestral (k=2)
+    s1 = sin(2*pi*mes_num/12), c1 = cos(2*pi*mes_num/12),
+    s2 = sin(4*pi*mes_num/12), c2 = cos(4*pi*mes_num/12),
+    t_f = factor(t_mes)              # nivel por paso temporal, requerido por ar1()
+  ) %>%
+  arrange(Station, t_mes)
+
+cat("Celdas estación-mes con esfuerzo > 0:", nrow(dat),
+    "| Estaciones:", n_distinct(dat$Station),
+    "| Meses:", n_distinct(dat$Mes), "\n")
+cat("Celdas con 0 eventos:", round(100*mean(dat$eventos == 0), 1), "%\n")
+cat("Varianza/media de los conteos:", round(var(dat$eventos)/mean(dat$eventos), 1), "\n")
+```
+
+```{r esfuerzo-figura, fig.height=6}
+serie <- dat %>%
+  group_by(Mes) %>%
+  summarise(eventos = sum(eventos), esfuerzo = sum(esfuerzo),
+            n_camaras = n_distinct(Station), .groups = "drop") %>%
+  mutate(indice = eventos / esfuerzo * ESCALA)
+
+p_esf <- (ggplot(serie, aes(Mes, esfuerzo)) + geom_col(fill = "grey65") +
+            labs(x = NULL, y = "Días-cámara", title = "Esfuerzo mensual")) /
+         (ggplot(serie, aes(Mes, n_camaras)) + geom_step() +
+            labs(x = NULL, y = "Cámaras activas", title = "Cámaras que aportan cada mes"))
+p_esf
+ggsave("Esfuerzo_mensual.png", p_esf, width = 9, height = 6, dpi = 150)
+```
+
+# Modelo de referencia
+
+Conteo de eventos por celda estación-mes, esfuerzo como *offset* logarítmico, binomial
+negativa (NB2), estacionalidad armónica, intercepto aleatorio por cámara y estructura
+AR(1) mensual dentro de cada cámara.
+
+```{r modelo}
+m_ref <- glmmTMB(eventos ~ t_anios + s1 + c1 + s2 + c2 +
+                   (1 | Station) + ar1(t_f + 0 | Station),
+                 offset = log_esf, family = nbinom2, data = dat)
+
+summary(m_ref)
+
+b  <- fixef(m_ref)$cond["t_anios"]
+ic <- confint(m_ref, parm = "t_anios")[1, 1:2]
+cat(sprintf("\nCambio anual del índice: %+.1f%%  (IC95%%: %+.1f%% a %+.1f%%)\n",
+            100*(exp(b)-1), 100*(exp(ic[1])-1), 100*(exp(ic[2])-1)))
+cat(sprintf("Cambio acumulado en %.1f años: x%.1f\n",
+            max(dat$t_anios), exp(b*max(dat$t_anios))))
+```
+
+## Estructura de correlación temporal
+
+ρ cuantifica la persistencia de los desvíos respecto del valor esperado: la correlación
+entre dos meses separados por k pasos es ρ^k. Es lo que impide tratar las celdas como
+observaciones independientes y lo que fija la escala temporal a la que conviene leer el
+índice.
+
+```{r ar1}
+vc  <- VarCorr(m_ref)$cond
+rho <- attr(vc[["Station.1"]], "correlation")[1, 2]
+
+cat("rho AR(1):", round(rho, 3), "\n")
+cat("DE del proceso AR(1) (escala log):", round(sqrt(vc[["Station.1"]][1,1]), 3),
+    "| DE del intercepto de cámara:", round(sqrt(vc[["Station"]][1,1]), 3), "\n")
+cat("Vida media de una anomalía:", round(log(0.5)/log(rho), 1), "meses",
+    "| caída al 10%:", round(log(0.1)/log(rho), 1), "meses\n")
+```
+
+## Selección de la estructura
+
+Se vuelve a correr al actualizar la base: con más meses, la estructura que mejor ajusta
+puede cambiar. No se evalúa un modelo que combine pendiente aleatoria por sitio y AR(1):
+ambas capturan que una cámara se aparta de forma sostenida del promedio, compiten por la
+misma varianza y en estos datos el ajuste conjunto colapsa la pendiente aleatoria (desvío 0,017, correlación con el intercepto 0,73): no se identifica como componente separado.
+
+```{r seleccion}
+cand <- list(
+  "Poisson, sin AR(1)"        = glmmTMB(eventos ~ t_anios + s1+c1+s2+c2 + (1|Station),
+                                        offset = log_esf, family = poisson, data = dat),
+  "NB, sin estacionalidad"    = glmmTMB(eventos ~ t_anios + (1|Station),
+                                        offset = log_esf, family = nbinom2, data = dat),
+  "NB + estacionalidad"       = glmmTMB(eventos ~ t_anios + s1+c1+s2+c2 + (1|Station),
+                                        offset = log_esf, family = nbinom2, data = dat),
+  "NB + pendiente aleatoria"  = glmmTMB(eventos ~ t_anios + s1+c1+s2+c2 + (t_anios|Station),
+                                        offset = log_esf, family = nbinom2, data = dat),
+  "NB + AR(1)  [referencia]"  = m_ref
+)
+
+imap_dfr(cand, function(m, nm) {
+  s <- summary(m)$coefficients$cond["t_anios", ]
+  tibble(modelo = nm, AIC = AIC(m), cambio_anual_pct = 100*(exp(s[1])-1),
+         EE = s[2], p = s[4])
+}) %>%
+  mutate(dAIC = AIC - min(AIC)) %>%
+  arrange(AIC) %>%
+  knitr::kable(digits = c(0, 1, 1, 3, 10, 1),
+               caption = "Estructuras candidatas (el modelo de referencia es el de menor AIC)")
+```
+
+## Diagnóstico de residuos
+
+```{r diagnostico, fig.height=6}
+sim <- simulateResiduals(m_ref, n = 1000)
+plot(sim)
+testDispersion(sim)
+testZeroInflation(sim)
+```
+
+# Producto 1 — Índice anual
+
+```{r indice-anual}
+m_anual <- glmmTMB(eventos ~ factor(anio) + s1 + c1 + (1 | Station),
+                   offset = log_esf, family = nbinom2, data = dat)
+
+idx <- emmeans(m_anual, ~ anio, type = "response", offset = 0) %>%
+  as_tibble() %>%
+  mutate(across(c(response, asymp.LCL, asymp.UCL), ~ . * ESCALA))
+
+idx %>% select(anio, indice = response, LCL = asymp.LCL, UCL = asymp.UCL) %>%
+  knitr::kable(digits = 2,
+               caption = paste0("Índice anual (eventos por ", ESCALA, " días-cámara)"))
+
+p_idx <- ggplot(idx, aes(factor(anio), response)) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL), linewidth = 0.8) +
+  labs(x = NULL, y = paste0("Eventos por ", ESCALA, " días-cámara"),
+       title = "Índice anual de actividad con IC95%",
+       caption = "Los años inicial y final de la serie son parciales")
+p_idx
+ggsave("Indice_anual.png", p_idx, width = 7, height = 4.5, dpi = 150)
+```
+
+# Producto 2 — Ordenamiento de cámaras
+
+Modos condicionales del modelo con pendiente aleatoria: ubican a cada cámara por su nivel
+de actividad y por su velocidad de cambio. Se usan como mapa para asignar esfuerzo de
+control, no como estimación alternativa de la tendencia global.
+
+```{r sitios, fig.height=7}
+m_sitio <- cand[["NB + pendiente aleatoria"]]
+
+# nivel observado de cada cámara, en las mismas unidades que el índice
+nivel <- dat %>%
+  group_by(Station) %>%
+  summarise(nivel = sum(eventos)/sum(esfuerzo)*ESCALA,
+            dias_camara = sum(esfuerzo), .groups = "drop")
+
+re <- as.data.frame(ranef(m_sitio)) %>%
+  filter(grpvar == "Station") %>%
+  select(term, Station = grp, condval, condsd) %>%
+  pivot_wider(names_from = term, values_from = c(condval, condsd)) %>%
+  rename(pend = condval_t_anios, pend_sd = condsd_t_anios) %>%
+  mutate(
+    pend_total = fixef(m_sitio)$cond["t_anios"] + pend,     # pendiente de la cámara
+    cambio_pct = 100*(exp(pend_total) - 1),
+    lo = 100*(exp(pend_total - 1.96*pend_sd) - 1),
+    hi = 100*(exp(pend_total + 1.96*pend_sd) - 1)
+  ) %>%
+  left_join(nivel, by = "Station") %>%
+  arrange(desc(cambio_pct))
+
+re %>% select(Station, nivel, dias_camara, cambio_anual_pct = cambio_pct, lo, hi) %>%
+  knitr::kable(digits = c(0, 1, 0, 1, 1, 1),
+               caption = paste0("Cámaras ordenadas por velocidad de cambio. 'nivel' = eventos por ",
+                                ESCALA, " días-cámara en toda la serie"))
+
+p_sitio <- re %>%
+  mutate(Station = fct_reorder(Station, cambio_pct)) %>%
+  ggplot(aes(cambio_pct, Station)) +
+  geom_vline(xintercept = 100*(exp(fixef(m_sitio)$cond["t_anios"])-1),
+             linetype = 2, colour = "#A50021") +
+  geom_pointrange(aes(xmin = lo, xmax = hi, size = nivel), linewidth = 0.4,
+                  fatten = 1.5) +
+  scale_size_continuous(range = c(0.3, 3),
+                        name = paste0("Nivel\n(eventos /\n", ESCALA, " días-cámara)")) +
+  labs(x = "Cambio anual del índice (%)", y = NULL,
+       title = "Cambio del índice por cámara",
+       subtitle = "Línea punteada: tendencia media de la red. Tamaño: nivel de actividad del sitio")
+p_sitio
+ggsave("Cambio_por_camara.png", p_sitio, width = 9, height = 7, dpi = 150)
+```
+
+# Producto 3 — Períodos de cambio (GAM y derivadas)
+
+Para evaluar intervenciones puntuales: contesta cuándo cambió el índice, no cuánto cambió
+en promedio.
+
+```{r gam}
+g <- gam(eventos ~ s(t_mes, k = 15) + s(mes_num, bs = "cc", k = 6) +
+           s(Station, bs = "re") + offset(log_esf),
+         family = nb(link = "log"), data = dat, method = "REML",
+         knots = list(mes_num = c(0.5, 12.5)))
+summary(g)
+```
+
+```{r derivada}
+nd <- tibble(t_mes = seq(min(dat$t_mes), max(dat$t_mes), length.out = 400),
+             mes_num = 6, Station = dat$Station[1], log_esf = 0)
+eps <- 1e-4
+X0 <- predict(g, nd, type = "lpmatrix", exclude = "s(Station)")
+X1 <- predict(g, mutate(nd, t_mes = t_mes + eps), type = "lpmatrix", exclude = "s(Station)")
+Xd <- (X1 - X0) / eps
+
+deriv <- nd %>%
+  mutate(d  = as.vector(Xd %*% coef(g)),
+         se = sqrt(rowSums((Xd %*% vcov(g)) * Xd)),
+         lo = d - 1.96*se, hi = d + 1.96*se,
+         signo = case_when(lo > 0 ~ "aumento", hi < 0 ~ "disminución",
+                           TRUE ~ "sin cambio"),
+         fecha = min(dat$Mes) %m+% months(round(t_mes)))
+
+p_der <- ggplot(deriv, aes(fecha, d)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), fill = "grey80") +
+  geom_line(aes(colour = signo, group = 1), linewidth = 1) +
+  scale_colour_manual(values = c(aumento = "#1B7837", `disminución` = "#A50021",
+                                 `sin cambio` = "grey40")) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(x = NULL, y = "Derivada de log(índice) por mes", colour = NULL,
+       title = "¿Cuándo cambia la tendencia?",
+       subtitle = "Tramos con IC95% de la derivada que excluye el cero")
+p_der
+ggsave("Derivada_tendencia.png", p_der, width = 9, height = 4.5, dpi = 150)
+
+deriv %>%
+  mutate(bloque = cumsum(signo != lag(signo, default = first(signo)))) %>%
+  group_by(bloque, signo) %>%
+  summarise(desde = format(min(fecha), "%Y-%m"), hasta = format(max(fecha), "%Y-%m"),
+            .groups = "drop") %>%
+  select(-bloque) %>%
+  knitr::kable(caption = "Tramos de cambio significativo")
+```
+
+```{r tendencia-figura}
+nd_f <- tibble(t_mes = seq(min(dat$t_mes), max(dat$t_mes), by = 0.25),
+               mes_num = 6, Station = dat$Station[1], log_esf = 0)
+pr <- predict(g, nd_f, type = "link", se.fit = TRUE, exclude = "s(Station)")
+nd_f <- nd_f %>%
+  mutate(fecha = min(dat$Mes) %m+% months(round(t_mes)),
+         fit = ESCALA*exp(pr$fit),
+         lo  = ESCALA*exp(pr$fit - 1.96*pr$se.fit),
+         hi  = ESCALA*exp(pr$fit + 1.96*pr$se.fit))
+
+p_tend <- ggplot() +
+  geom_point(data = serie, aes(Mes, indice, size = esfuerzo), alpha = 0.45, colour = "grey30") +
+  geom_ribbon(data = nd_f, aes(fecha, ymin = lo, ymax = hi), fill = "#A50021", alpha = 0.2) +
+  geom_line(data = nd_f, aes(fecha, fit), colour = "#A50021", linewidth = 1.2) +
+  scale_size_continuous(range = c(0.8, 4), name = "Esfuerzo\n(días-cámara)") +
+  labs(x = NULL, y = paste0("Eventos por ", ESCALA, " días-cámara"),
+       title = "Tendencia del índice de actividad de perros asilvestrados")
+p_tend
+ggsave("Tendencia_indice.png", p_tend, width = 9, height = 5.5, dpi = 150)
+```
+
+# Serie de apoyo por temporadas de 90 días
+
+Serie descriptiva, **sin modelo propio**. Cada día se asigna al equinoccio o solsticio
+más cercano, con temporadas de unos 90 días centradas en esos eventos, como en los
+manuscritos. No entra en la inferencia: el veredicto de tendencia sale del índice anual y
+del modelo de referencia. Sirve para ver la forma de la serie a una escala intermedia.
+
+```{r temporadas-anclas}
+anclas <- tibble(
+  fecha = as_date(c("2018-09-22","2018-12-21","2019-03-20","2019-06-21","2019-09-23",
+                    "2019-12-22","2020-03-20","2020-06-20","2020-09-22","2020-12-21",
+                    "2021-03-20","2021-06-21","2021-09-22","2021-12-21","2022-03-20",
+                    "2022-06-21","2022-09-22","2022-12-21","2023-03-20","2023-06-21",
+                    "2023-09-23","2023-12-21","2024-03-20","2024-06-21","2024-09-23",
+                    "2024-12-21","2025-03-20","2025-06-21","2025-09-23")),
+  nombre = rep(c("Equi pri", "Sols ver", "Equi oto", "Sols inv"), length.out = 29)
+) %>%
+  mutate(etiqueta = paste(nombre, year(fecha)))
+
+# límites entre temporadas: punto medio entre anclas consecutivas
+mids <- as.numeric(anclas$fecha[-1]) - diff(as.numeric(anclas$fecha)) / 2
+asignar_temporada <- function(f) anclas$etiqueta[findInterval(as.numeric(f), mids) + 1]
+```
+
+```{r temporadas-datos}
+esf_dia <- camop_largo %>%           # ya recortado al alcance de los registros
+  group_by(fecha) %>%
+  summarise(esfuerzo = sum(Valor, na.rm = TRUE), .groups = "drop")
+
+ev_dia <- perros %>%
+  mutate(fecha = fecha_ev) %>%     # fecha_ev ya viene interpretada por parsear_fecha()
+  count(fecha, name = "eventos")
+
+temp <- esf_dia %>%
+  left_join(ev_dia, by = "fecha") %>%
+  mutate(eventos  = replace_na(eventos, 0),
+         etiqueta = asignar_temporada(fecha)) %>%
+  filter(esfuerzo > 0) %>%
+  group_by(etiqueta) %>%
+  summarise(inicio = min(fecha), dias_operativos = n(),
+            eventos = sum(eventos), esfuerzo = sum(esfuerzo), .groups = "drop") %>%
+  mutate(indice = eventos / esfuerzo * ESCALA,
+         tipo = if_else(dias_operativos < 80, "parcial", "completa")) %>%
+  arrange(inicio)
+
+temp %>%
+  select(etiqueta, inicio, dias_operativos, eventos, esfuerzo, indice, tipo) %>%
+  knitr::kable(digits = c(0, 0, 0, 0, 0, 1, 0),
+               caption = paste0("Índice por temporada (eventos por ", ESCALA,
+                                " días-cámara). 'parcial' = menos de 80 días operativos"))
+```
+
+```{r temporadas-figura}
+p_temp <- temp %>%
+  mutate(etiqueta = fct_inorder(etiqueta)) %>%
+  ggplot(aes(inicio, indice)) +
+  geom_line(colour = "grey40") +
+  geom_point(aes(shape = tipo, size = esfuerzo), colour = "#A50021") +
+  scale_shape_manual(values = c(completa = 16, parcial = 1), name = "Temporada") +
+  scale_size_continuous(range = c(1.5, 5), name = "Días-cámara") +
+  labs(x = NULL, y = paste0("Eventos por ", ESCALA, " días-cámara"),
+       title = "Índice por temporadas de 90 días",
+       subtitle = "Apoyo descriptivo: sin modelo propio, el veredicto sale del índice anual y del GLMM")
+p_temp
+ggsave("Serie_temporadas.png", p_temp, width = 9, height = 5, dpi = 150)
+```
+
+# Resumen
+
+```{r resumen}
+s <- summary(m_ref)$coefficients$cond["t_anios", ]
+
+cat("=======================================================\n")
+cat("Respuesta     : eventos mensuales por cámara\n")
+cat("Esfuerzo      : offset log(días-cámara operativos)\n")
+cat("Distribución  : binomial negativa (var/media =",
+    round(var(dat$eventos)/mean(dat$eventos), 1), ")\n")
+cat("Estructura    : armónicos + (1|Station) + AR(1) mensual (rho =", round(rho, 3), ")\n")
+cat("Observaciones :", nrow(dat), "celdas |", n_distinct(dat$Station), "cámaras |",
+    n_distinct(dat$Mes), "meses |", round(100*mean(dat$eventos == 0), 1), "% de ceros\n")
+cat("-------------------------------------------------------\n")
+cat(sprintf("Tendencia     : %+.3f log-índice/año (EE %.3f, p = %.2g)\n", s[1], s[2], s[4]))
+cat(sprintf("Cambio anual  : %+.1f%% (IC95%%: %+.1f%% a %+.1f%%)\n",
+            100*(exp(b)-1), 100*(exp(ic[1])-1), 100*(exp(ic[2])-1)))
+cat(sprintf("Acumulado     : x%.1f en %.1f años\n", exp(b*max(dat$t_anios)), max(dat$t_anios)))
+cat("=======================================================\n")
+```
+
+# Notas de uso
+
+- **Frecuencia de lectura.** Con una vida media de las anomalías del orden de cuatro meses
+  (ver sección de AR(1)), un valor mensual alto no distingue por sí mismo un aumento real
+  de una racha favorable en una cámara. Conviene actualizar la base mensualmente pero
+  evaluar la tendencia una vez al año; el análisis de derivadas queda reservado para
+  evaluar intervenciones concretas.
+- **El mes es la unidad de modelado, no la de reporte.** Lo que se lleva a una mesa de
+  gestión es el índice anual con sus intervalos, no la serie mensual.
+- **El índice mide actividad detectada por unidad de esfuerzo**, no abundancia. Si hubo
+  recambio de modelos de cámara y está registrado, conviene incorporarlo como covariable.
+- **Control de robustez opcional.** Repetir el modelo de referencia con respuesta binaria
+  (`as.integer(eventos > 0)`, `family = binomial("cloglog")`, mismo *offset*) verifica que
+  la tendencia no dependa del supuesto de independencia entre registros sucesivos de una
+  misma jauría.
+
+```{r sesion}
+sessionInfo()
+```
