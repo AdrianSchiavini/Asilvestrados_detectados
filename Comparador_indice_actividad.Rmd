@@ -1,0 +1,676 @@
+---
+title: "Comparador del índice de actividad entre dos períodos"
+subtitle: "Cámaras trampa — proyecto Perros tendencias"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r librerias}
+library(shiny)
+library(DT)
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(readr); library(stringr)
+  library(lubridate); library(ggplot2); library(MASS)
+})
+select <- dplyr::select   # MASS enmascara select()
+theme_set(theme_minimal(base_size = 13))
+```
+
+```{r parametros}
+# Lo único que conviene editar para trabajar con otra base. Los archivos también
+# pueden cargarse desde la interfaz, más abajo.
+ARCHIVO_REGISTROS_DEF <- "Perroscámaras.csv"      # tabla de registros
+ARCHIVO_CAMOP_DEF     <- "cameraOperation.csv"    # matriz de operación (camtrapR)
+ESCALA                <- 1000                     # eventos por 1.000 días-cámara
+
+# La matriz de operación suele cubrir más estaciones y más fechas que la tabla
+# de registros: puede incluir cámaras cuyas fotografías nunca se procesaron y
+# días anteriores o posteriores al período procesado. Ese esfuerzo entraría como
+# ceros falsos. Por eso la matriz se recorta automáticamente al alcance de la
+# tabla de registros, según se explica más abajo.
+
+ANCHOS <- c("Sólo ese mes" = 1, "Trimestre (3 meses)" = 3, "Año completo (12 meses)" = 12)
+```
+
+```{r funciones}
+# --- Lectura ---------------------------------------------------------------
+
+# Lee un csv detectando el separador (';' o ','). Las exportaciones de camtrapR
+# varían entre coma y punto y coma según la configuración regional.
+leer_csv <- function(archivo) {
+  sep <- if (str_detect(read_lines(archivo, n_max = 1), ";")) ";" else ","
+  if (sep == ";") read_csv2(archivo, show_col_types = FALSE)
+  else read_csv(archivo, show_col_types = FALSE, guess_max = 50000)
+}
+
+# Interpreta la fecha probando los formatos habituales y quedándose con el que
+# deja menos valores sin convertir: ISO (2023-10-04 11:30:25) y día/mes/año
+# (4/10/2023 11:30) conviven entre exportaciones.
+parsear_fecha <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as_date(x))
+  s <- as.character(x)
+  cand <- suppressWarnings(list(
+    as_date(ymd_hms(s, quiet = TRUE)), as_date(ymd(s, quiet = TRUE)),
+    as_date(dmy_hms(s, quiet = TRUE)), as_date(dmy_hm(s, quiet = TRUE)),
+    as_date(dmy(s, quiet = TRUE))))
+  faltan <- vapply(cand, function(z) sum(is.na(z)), integer(1))
+  if (min(faltan) > 0.05 * length(s))
+    warning("Más del 5% de las fechas no se pudo interpretar.", call. = FALSE)
+  cand[[which.min(faltan)]]
+}
+
+# Lee una tabla de registros y la reduce a EVENTOS INDEPENDIENTES.
+# Funciona tanto con tablas completas de camtrapR (con Species, metadatos y una
+# fila por individuo) como con tablas ya reducidas a dos columnas.
+leer_registros <- function(archivo, especie = NULL) {
+  x <- leer_csv(archivo)
+  stopifnot(all(c("Station", "DateTimeOriginal") %in% names(x)))
+  if (!is.null(especie) && "Species" %in% names(x)) x <- filter(x, Species == especie)
+
+  x <- mutate(x, fecha_ev = parsear_fecha(DateTimeOriginal))
+
+  n_filas <- nrow(x)
+  if ("tipo_registro" %in% names(x)) x <- filter(x, is.na(tipo_registro))
+  n_sin_generadas <- nrow(x)
+  x <- distinct(x, Station, DateTimeOriginal, .keep_all = TRUE)
+
+  attr(x, "conteos") <- c(filas = n_filas, sin_generadas = n_sin_generadas,
+                          eventos = nrow(x))
+  x
+}
+
+# Pasa la matriz de operación a formato largo (una fila por estación y día).
+# La primera columna es la estación, tenga nombre o no. Los valores pueden ser
+# fraccionarios (0,5) cuando una estación tiene más de una cámara y sólo parte
+# de ellas estuvo operativa ese día.
+leer_esfuerzo <- function(archivo) {
+  camop <- leer_csv(archivo)
+  names(camop)[1] <- "Station"
+  camop %>%
+    pivot_longer(-Station, names_to = "fecha", values_to = "Valor") %>%
+    mutate(fecha = as_date(fecha), Valor = as.numeric(Valor)) %>%
+    filter(!is.na(fecha))
+}
+
+# --- Definición de los períodos ---------------------------------------------
+
+# Ventana de N meses que TERMINA en el mes elegido.
+ventana_meses <- function(mes, n_meses) {
+  fin_mes <- floor_date(as_date(mes), "month")
+  ini_mes <- fin_mes %m-% months(n_meses - 1)
+  list(desde = ini_mes,
+       hasta = ceiling_date(fin_mes, "month") - days(1),
+       n_meses = n_meses)
+}
+
+ventanas_se_superponen <- function(va, vb) {
+  va$desde <= vb$hasta && vb$desde <= va$hasta
+}
+
+# --- Grilla de análisis -----------------------------------------------------
+
+# La grilla parte del ESFUERZO: las cámaras activas sin eventos entran como cero.
+construir_grilla <- function(registros, esfuerzo_largo, va, vb, escala = 1000) {
+  clasificar <- function(f) case_when(
+    f >= va$desde & f <= va$hasta ~ "A",
+    f >= vb$desde & f <= vb$hasta ~ "B",
+    TRUE ~ NA_character_)
+
+  esf <- esfuerzo_largo %>%
+    mutate(periodo = clasificar(fecha)) %>%
+    filter(!is.na(periodo)) %>%
+    group_by(Station, periodo) %>%
+    summarise(esfuerzo = sum(Valor, na.rm = TRUE), .groups = "drop")
+
+  ev <- registros %>%
+    mutate(periodo = clasificar(fecha_ev)) %>%
+    filter(!is.na(periodo)) %>%
+    count(Station, periodo, name = "ev")
+
+  esf %>%
+    filter(esfuerzo > 0) %>%
+    left_join(ev, by = c("Station", "periodo")) %>%
+    mutate(ev = replace_na(ev, 0),
+           periodo = factor(periodo, levels = c("A", "B")),
+           Station = factor(Station),
+           log_esf = log(esfuerzo),
+           indice  = ev / esfuerzo * escala)
+}
+
+resumir <- function(dat, escala = 1000) {
+  dat %>%
+    group_by(periodo) %>%
+    summarise(camaras = n(), esfuerzo = sum(esfuerzo), eventos = sum(ev),
+              indice = sum(ev) / sum(esfuerzo) * escala,
+              camaras_sin_eventos = sum(ev == 0), .groups = "drop")
+}
+
+camaras_comunes <- function(dat) {
+  length(intersect(dat$Station[dat$periodo == "A"], dat$Station[dat$periodo == "B"]))
+}
+
+# --- Prueba de cambio -------------------------------------------------------
+
+# Binomial negativa con offset del esfuerzo. Con dos períodos el efecto aleatorio
+# de cámara no es identificable, de modo que no se incluye.
+probar_cambio <- function(dat) {
+  if (sum(dat$ev) == 0)
+    return(list(ok = FALSE, motivo = "No hay eventos en ninguno de los dos períodos."))
+  if (n_distinct(dat$periodo[dat$esfuerzo > 0]) < 2)
+    return(list(ok = FALSE, motivo = "Uno de los períodos no tiene esfuerzo."))
+
+  m <- try(suppressWarnings(glm.nb(ev ~ periodo + offset(log_esf), data = dat)),
+           silent = TRUE)
+  familia <- "binomial negativa"
+  if (inherits(m, "try-error") || !is.finite(m$theta)) {
+    m <- glm(ev ~ periodo + offset(log_esf), family = poisson, data = dat)
+    familia <- "Poisson (la binomial negativa no convergió)"
+  }
+
+  cf <- summary(m)$coefficients
+  if (!"periodoB" %in% rownames(cf))
+    return(list(ok = FALSE, motivo = "El modelo no pudo estimar el efecto del período."))
+  est <- cf["periodoB", 1]; se <- cf["periodoB", 2]
+
+  list(ok = TRUE, modelo = m, familia = familia,
+       RR = exp(est), lo = exp(est - 1.96*se), hi = exp(est + 1.96*se),
+       p = cf["periodoB", 4],
+       theta = if (!is.null(m$theta)) m$theta else NA_real_)
+}
+
+# --- Potencia ---------------------------------------------------------------
+
+potencia_RR <- function(RR, dat, tasa_base, theta, alfa = 0.05, n_sim = 300) {
+  mu <- dat$esfuerzo * tasa_base * if_else(dat$periodo == "B", RR, 1)
+  sig <- 0L; ok <- 0L
+  for (i in seq_len(n_sim)) {
+    y <- rnbinom(length(mu), mu = mu, size = theta)
+    if (sum(y) == 0) next
+    fit <- try(suppressWarnings(
+      glm.nb(y ~ periodo + offset(log_esf), data = mutate(dat, y = y))), silent = TRUE)
+    if (inherits(fit, "try-error")) next
+    cf <- summary(fit)$coefficients
+    if (!"periodoB" %in% rownames(cf)) next
+    ok <- ok + 1L
+    if (cf["periodoB", 4] < alfa) sig <- sig + 1L
+  }
+  tibble(RR = RR, potencia = if (ok > 0) sig/ok else NA_real_, ajustes = ok)
+}
+
+curva_potencia <- function(dat, tasa_base, theta, alfa = 0.05, n_sim = 300,
+                           rejilla = c(0.1, 0.2, 0.33, 0.5, 0.67, 0.8, 1,
+                                       1.25, 1.5, 2, 3, 5, 10),
+                           avance = NULL) {
+  res <- vector("list", length(rejilla))
+  for (k in seq_along(rejilla)) {
+    res[[k]] <- potencia_RR(rejilla[k], dat, tasa_base, theta, alfa, n_sim)
+    if (!is.null(avance)) avance(k / length(rejilla))
+  }
+  bind_rows(res)
+}
+
+# Efecto mínimo detectable: NA si la potencia objetivo no se alcanza.
+efecto_minimo <- function(curva, objetivo = 0.8, direccion = c("aumento", "caida")) {
+  direccion <- match.arg(direccion)
+  df <- curva %>% filter(!is.na(potencia)) %>%
+    filter(if (direccion == "aumento") RR >= 1 else RR <= 1) %>%
+    arrange(RR)
+  if (nrow(df) < 2) return(NA_real_)
+  for (i in seq_len(nrow(df) - 1)) {
+    p1 <- df$potencia[i]; p2 <- df$potencia[i + 1]
+    if ((p1 - objetivo) * (p2 - objetivo) <= 0 && p1 != p2)
+      return(df$RR[i] + (objetivo - p1) * (df$RR[i+1] - df$RR[i]) / (p2 - p1))
+  }
+  NA_real_
+}
+
+# --- Serie mensual y avisos ---------------------------------------------------
+
+serie_mensual <- function(registros, esfuerzo_largo, escala = 1000) {
+  esf <- esfuerzo_largo %>%
+    mutate(Mes = floor_date(fecha, "month")) %>%
+    group_by(Mes) %>%
+    summarise(esfuerzo = sum(Valor, na.rm = TRUE),
+              camaras = n_distinct(Station[Valor > 0]), .groups = "drop") %>%
+    filter(esfuerzo > 0)
+  ev <- registros %>% mutate(Mes = floor_date(fecha_ev, "month")) %>% count(Mes, name = "ev")
+  esf %>% left_join(ev, by = "Mes") %>%
+    mutate(ev = replace_na(ev, 0), indice = ev / esfuerzo * escala)
+}
+
+avisos <- function(dat, va, vb, res) {
+  av <- character(0)
+  if (ventanas_se_superponen(va, vb))
+    av <- c(av, paste0("Las dos ventanas se superponen (", va$desde, " a ", va$hasta,
+                       " y ", vb$desde, " a ", vb$hasta,
+                       "): comparten observaciones y la comparación no es válida."))
+  comunes <- camaras_comunes(dat)
+  n_a <- res$camaras[res$periodo == "A"]; n_b <- res$camaras[res$periodo == "B"]
+  if (comunes < 0.5 * min(n_a, n_b))
+    av <- c(av, paste0("Sólo ", comunes, " cámaras estuvieron activas en ambos períodos (",
+                       n_a, " y ", n_b, " por período): parte de la diferencia puede",
+                       " reflejar qué sitios aportaron datos y no cuánta actividad hubo."))
+  if (min(res$eventos) < 10)
+    av <- c(av, paste0("Alguno de los períodos tiene menos de 10 eventos (",
+                       paste(res$eventos, collapse = " y "),
+                       "): la estimación es muy imprecisa."))
+  if (month(va$hasta) != month(vb$hasta))
+    av <- c(av, paste0("Los períodos terminan en meses distintos (",
+                       format(va$hasta, "%b"), " y ", format(vb$hasta, "%b"),
+                       "): la diferencia mezcla cambio temporal con estacionalidad."))
+  av
+}
+```
+
+Este documento compara el **índice de actividad** —eventos fotográficos
+independientes por `r ESCALA` días-cámara efectivos— entre dos períodos elegidos con
+deslizadores, y evalúa si el cambio es estadísticamente significativo.
+
+Responde si **difieren dos momentos concretos**. No responde si la población cambió de
+forma sostenida: el índice mensual tiene autocorrelación fuerte, de modo que cada período
+es una realización de un proceso persistente y una diferencia puede deberse a una racha
+local. Para evaluar tendencia corresponden el índice anual o el modelo de tendencia de la
+serie completa.
+
+# Datos
+
+```{r entrada-datos}
+fluidRow(
+  column(6, fileInput("f_reg", "Tabla de registros (.csv)", accept = ".csv",
+                      buttonLabel = "Examinar", placeholder = ARCHIVO_REGISTROS_DEF)),
+  column(6, fileInput("f_camop", "Matriz de operación de cámaras (.csv)", accept = ".csv",
+                      buttonLabel = "Examinar", placeholder = ARCHIVO_CAMOP_DEF))
+)
+fluidRow(
+  column(6, uiOutput("ui_especie")),
+  column(6, uiOutput("ui_ventana_estudio"))
+)
+```
+
+```{r reactivos-datos}
+ruta_reg <- reactive({
+  if (!is.null(input$f_reg)) input$f_reg$datapath
+  else if (file.exists(ARCHIVO_REGISTROS_DEF)) ARCHIVO_REGISTROS_DEF else NULL
+})
+ruta_camop <- reactive({
+  if (!is.null(input$f_camop)) input$f_camop$datapath
+  else if (file.exists(ARCHIVO_CAMOP_DEF)) ARCHIVO_CAMOP_DEF else NULL
+})
+
+registros_crudos <- reactive({
+  req(ruta_reg())
+  validate(need(file.exists(ruta_reg()), "No se encuentra la tabla de registros."))
+  leer_registros(ruta_reg(), especie = NULL)
+})
+
+output$ui_especie <- renderUI({
+  req(registros_crudos())
+  sp <- registros_crudos()$Species
+  if (is.null(sp)) return(NULL)
+  opciones <- sort(unique(as.character(sp)))
+  if (length(opciones) <= 1) helpText(paste("Especie en la tabla:", opciones[1]))
+  else selectInput("especie", "Especie", choices = opciones,
+                   selected = if ("Canis lupus familiaris" %in% opciones)
+                     "Canis lupus familiaris" else opciones[1])
+})
+
+registros <- reactive({
+  x <- registros_crudos()
+  if (!is.null(input$especie) && "Species" %in% names(x))
+    x <- filter(x, Species == input$especie)
+  x
+})
+
+esfuerzo_crudo <- reactive({
+  req(ruta_camop())
+  validate(need(file.exists(ruta_camop()),
+                "No se encuentra la matriz de operación de cámaras."))
+  leer_esfuerzo(ruta_camop())
+})
+
+# Recorte al alcance de la tabla de registros. De la matriz de operación se
+# conservan únicamente las estaciones que aparecen en los registros y los días
+# comprendidos entre el primer y el último evento registrado. El esfuerzo que
+# queda fuera corresponde a cámaras o a fechas sin registros procesados, y
+# entraría en el análisis como ceros falsos.
+esfuerzo_alcance <- reactive({
+  e <- esfuerzo_crudo(); r <- registros()
+  validate(need(nrow(r) > 0, "La tabla de registros no tiene filas."))
+  est <- unique(as.character(r$Station))
+  ini <- min(r$fecha_ev, na.rm = TRUE)
+  fin <- max(r$fecha_ev, na.rm = TRUE)
+  out <- filter(e, Station %in% est, fecha >= ini, fecha <= fin)
+  validate(need(nrow(out) > 0,
+                "Ninguna estación o fecha de la matriz de operación coincide con los registros."))
+  attr(out, "recorte") <- list(
+    est_total = n_distinct(e$Station), est_conservadas = n_distinct(out$Station),
+    fecha_min_camop = min(e$fecha), fecha_max_camop = max(e$fecha),
+    ini = ini, fin = fin)
+  out
+})
+
+output$ui_ventana_estudio <- renderUI({
+  e <- esfuerzo_alcance()
+  dateRangeInput("ventana", "Ventana de estudio",
+                 start = min(e$fecha), end = max(e$fecha),
+                 min = min(e$fecha), max = max(e$fecha),
+                 format = "yyyy-mm-dd", language = "es", separator = " a ")
+})
+
+# El control de arriba permite acotar todavía más la ventana, nunca ampliarla
+# más allá del alcance de los registros.
+esfuerzo <- reactive({
+  e <- esfuerzo_alcance(); req(input$ventana)
+  filter(e, fecha >= input$ventana[1], fecha <= input$ventana[2])
+})
+
+serie <- reactive(serie_mensual(registros(), esfuerzo(), ESCALA))
+```
+
+```{r resumen-datos}
+renderUI({
+  ct <- attr(registros_crudos(), "conteos"); s <- serie()
+  rc <- attr(esfuerzo_alcance(), "recorte")
+  tags$ul(
+    tags$li(sprintf("Filas leídas: %d. Tras excluir filas generadas por conteo: %d. Eventos independientes: %d.",
+                    ct["filas"], ct["sin_generadas"], ct["eventos"])),
+    tags$li(sprintf("Matriz de operación recortada al alcance de los registros: %d de %d estaciones conservadas; fechas de %s a %s (el archivo cubría de %s a %s).",
+                    rc$est_conservadas, rc$est_total,
+                    format(rc$ini), format(rc$fin),
+                    format(rc$fecha_min_camop), format(rc$fecha_max_camop))),
+    tags$li(sprintf("Meses con esfuerzo dentro de la ventana: %d (%s a %s).", nrow(s),
+                    format(min(s$Mes), "%Y-%m"), format(max(s$Mes), "%Y-%m"))),
+    tags$li(sprintf("Cámaras que aportan esfuerzo: %d.", n_distinct(esfuerzo()$Station))))
+})
+```
+
+El índice se calcula sobre **eventos fotográficos independientes**. Algunas exportaciones
+de camtrapR traen una fila por individuo y por archivo de imagen —un grupo de nueve perros
+puede ocupar dieciocho filas con la misma cámara y la misma marca temporal—, y contar esas
+filas sobrestima el índice; como además el tamaño medio de grupo cambia a lo largo de la
+serie, introduce tendencia espuria. El documento siempre descarta las filas expandidas por
+conteo de individuos y conserva una fila por combinación de cámara y marca temporal. Si la
+tabla ya viene reducida a eventos, los tres números de arriba coinciden y la reducción no
+cambia nada.
+
+# Elección de los períodos
+
+```{r entrada-periodos}
+uiOutput("ui_sliders")
+radioButtons("ancho", "Ancho de cada período", choices = ANCHOS, selected = 1,
+             inline = TRUE)
+helpText("La ventana termina en el mes elegido. Eligiendo el mismo mes de dos años",
+         "distintos, la estacionalidad queda controlada por diseño.")
+```
+
+```{r reactivos-periodos}
+output$ui_sliders <- renderUI({
+  s <- serie()
+  validate(need(nrow(s) > 1, "La serie no tiene meses con esfuerzo."))
+  mn <- min(s$Mes); mx <- max(s$Mes)
+  tagList(
+    sliderInput("mes_a", "Período A (referencia)", min = mn, max = mx,
+                value = max(mn, mx %m-% months(12)), timeFormat = "%Y-%m",
+                step = 1, width = "100%"),
+    sliderInput("mes_b", "Período B (comparación)", min = mn, max = mx,
+                value = mx, timeFormat = "%Y-%m", step = 1, width = "100%"))
+})
+
+ventanas <- reactive({
+  req(input$mes_a, input$mes_b, input$ancho)
+  n <- as.integer(input$ancho)
+  list(a = ventana_meses(input$mes_a, n), b = ventana_meses(input$mes_b, n))
+})
+
+grilla <- reactive({
+  v <- ventanas()
+  d <- construir_grilla(registros(), esfuerzo(), v$a, v$b, ESCALA)
+  validate(need(nrow(d) > 0, "Ninguna cámara estuvo operativa en los períodos elegidos."))
+  d
+})
+
+res <- reactive(resumir(grilla(), ESCALA))
+prueba <- reactive(probar_cambio(grilla()))
+```
+
+```{r serie-contexto}
+renderPlot({
+  v <- ventanas(); s <- serie()
+  rect <- tibble(xmin = c(v$a$desde, v$b$desde), xmax = c(v$a$hasta, v$b$hasta),
+                 grupo = c("A", "B"))
+  ggplot(s, aes(Mes, indice)) +
+    geom_rect(data = rect, inherit.aes = FALSE,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = grupo),
+              alpha = 0.25) +
+    scale_fill_manual(values = c(A = "#4575B4", B = "#A50021"), name = "Período") +
+    geom_col(width = 20, fill = "grey55") +
+    labs(x = NULL, y = paste0("Eventos por ", ESCALA, " días-cámara"),
+         subtitle = "Serie mensual completa, con los dos períodos elegidos sombreados")
+}, height = 280)
+```
+
+```{r tabla-resumen}
+renderTable({
+  v <- ventanas()
+  res() %>%
+    mutate(periodo = c("A", "B"),
+           desde = c(as.character(v$a$desde), as.character(v$b$desde)),
+           hasta = c(as.character(v$a$hasta), as.character(v$b$hasta))) %>%
+    select(periodo, desde, hasta, camaras,
+           `cámaras sin eventos` = camaras_sin_eventos,
+           `días-cámara` = esfuerzo, eventos, `índice` = indice)
+}, digits = 1)
+```
+
+# ¿Cambió el índice?
+
+```{r avisos}
+renderUI({
+  v <- ventanas()
+  av <- avisos(grilla(), v$a, v$b, res())
+  if (!length(av)) return(NULL)
+  div(class = "alert alert-warning", role = "alert",
+      tags$b("Advertencias sobre el diseño de la comparación"),
+      tags$ul(lapply(av, tags$li)))
+})
+```
+
+```{r veredicto}
+renderUI({
+  p <- prueba(); r <- res(); v <- ventanas()
+  if (!isTRUE(p$ok)) return(div(class = "alert alert-danger", p$motivo))
+  # Los controles de α y potencia se crean más abajo en el documento: en el
+  # primer render pueden no existir todavía.
+  alfa <- if (is.null(input$alfa) || !is.finite(input$alfa)) 0.05 else input$alfa
+  signif <- p$p < alfa
+  div(class = if (signif) "alert alert-success" else "alert alert-secondary",
+      h4(if (signif) "Hay cambio significativo" else "No se detecta cambio significativo"),
+      p(sprintf("Período A (%s a %s): %.1f eventos por %s días-cámara.",
+                v$a$desde, v$a$hasta, r$indice[1], format(ESCALA, big.mark = "."))),
+      p(sprintf("Período B (%s a %s): %.1f eventos por %s días-cámara.",
+                v$b$desde, v$b$hasta, r$indice[2], format(ESCALA, big.mark = "."))),
+      p(tags$b(sprintf("Razón B/A = %.2f (IC95%%: %.2f a %.2f); p = %.3f",
+                       p$RR, p$lo, p$hi, p$p)),
+        sprintf("  — cambio de %+.0f%%.", 100*(p$RR - 1))),
+      p(tags$small(sprintf("Modelo: %s con offset del esfuerzo. Dispersión theta = %s.",
+                           p$familia,
+                           if (is.na(p$theta)) "no aplica" else sprintf("%.2f", p$theta)))),
+      if (!signif) p(tags$small(tags$b("Importante:"),
+        "un resultado no significativo no prueba que el índice se haya mantenido estable.",
+        "Verificá más abajo qué magnitud de cambio era detectable con este esfuerzo.")))
+})
+```
+
+```{r plot-cajas}
+renderPlot({
+  v <- ventanas()
+  etiq <- c(A = paste0("A: ", format(v$a$desde, "%Y-%m"), " a ", format(v$a$hasta, "%Y-%m")),
+            B = paste0("B: ", format(v$b$desde, "%Y-%m"), " a ", format(v$b$hasta, "%Y-%m")))
+  grilla() %>%
+    mutate(grupo = etiq[as.character(periodo)]) %>%
+    ggplot(aes(grupo, indice)) +
+    geom_boxplot(width = 0.35, outlier.shape = NA, colour = "grey55") +
+    geom_jitter(aes(size = esfuerzo), width = 0.08, height = 0, alpha = 0.6) +
+    stat_summary(fun = mean, geom = "point", shape = 23, size = 4,
+                 fill = "#A50021", colour = "#A50021") +
+    scale_size_continuous(range = c(1, 4), name = "Días-cámara") +
+    labs(x = NULL, y = paste0("Eventos por ", ESCALA, " días-cámara"),
+         subtitle = "Cada punto es una cámara. Rombo rojo: media por cámara")
+}, height = 330)
+```
+
+El conteo de eventos por cámara se modela con el esfuerzo como término de desplazamiento
+(*offset*) logarítmico y distribución binomial negativa, de modo que el predictor equivale
+al logaritmo del índice y la sobre-dispersión queda contemplada. No se modela el cociente
+eventos/esfuerzo: perdería la ponderación por esfuerzo y la verosimilitud dejaría de
+corresponder a datos de conteo. Con sólo dos períodos, el efecto aleatorio de cámara no es
+identificable —su varianza colapsa— y la sobre-dispersión de la binomial negativa absorbe
+la heterogeneidad entre sitios.
+
+# Potencia y efecto mínimo detectable
+
+```{r entrada-potencia}
+fluidRow(
+  column(4, numericInput("alfa", "Significancia (α)", value = 0.05,
+                         min = 0.001, max = 0.2, step = 0.01)),
+  column(4, numericInput("potencia", "Potencia objetivo", value = 0.80,
+                         min = 0.5, max = 0.99, step = 0.05)),
+  column(4, selectInput("n_sim", "Simulaciones por punto",
+                        choices = c(200, 500, 1000), selected = 300))
+)
+actionButton("correr_potencia", "Calcular potencia", class = "btn-primary")
+helpText("Se calcula por simulación: demora entre algunos segundos y un par de minutos.")
+```
+
+```{r reactivos-potencia}
+potencia_res <- eventReactive(input$correr_potencia, {
+  d <- grilla(); r <- res(); p <- prueba()
+  req(isTRUE(p$ok), input$alfa, input$potencia, input$n_sim)
+  theta <- if (is.na(p$theta)) 1e6 else p$theta      # Poisson -> theta muy grande
+  tasa_base <- r$eventos[r$periodo == "A"] / r$esfuerzo[r$periodo == "A"]
+  if (!is.finite(tasa_base) || tasa_base <= 0)
+    tasa_base <- max(sum(d$ev), 1) / sum(d$esfuerzo)
+  n_sim <- as.integer(input$n_sim)
+
+  withProgress(message = "Simulando potencia", value = 0, {
+    curva <- curva_potencia(d, tasa_base, theta, input$alfa, n_sim,
+                            avance = function(fr) setProgress(value = fr))
+    pot_obs <- potencia_RR(p$RR, d, tasa_base, theta, input$alfa, n_sim)$potencia
+  })
+  list(curva = curva, pot_obs = pot_obs,
+       mde_sube = efecto_minimo(curva, input$potencia, "aumento"),
+       mde_baja = efecto_minimo(curva, input$potencia, "caida"),
+       RR = p$RR, objetivo = input$potencia, alfa = input$alfa, n_sim = n_sim)
+})
+```
+
+```{r texto-potencia}
+renderUI({
+  if (is.null(input$correr_potencia) || input$correr_potencia == 0)
+    return(div(class = "alert alert-info", "Presioná ", tags$b("Calcular potencia"),
+               " para estimar qué magnitud de cambio era detectable con el esfuerzo",
+               " de los períodos elegidos."))
+  x <- potencia_res()
+  txt_sube <- if (is.na(x$mde_sube)) "ningún aumento alcanza la potencia objetivo"
+              else sprintf("aumentos del %.0f%% o más", 100*(x$mde_sube - 1))
+  txt_baja <- if (is.na(x$mde_baja)) "ninguna caída alcanza la potencia objetivo"
+              else sprintf("caídas del %.0f%% o más", 100*(1 - x$mde_baja))
+  div(class = "alert alert-light border",
+      h5(sprintf("Efecto mínimo detectable (potencia %.2f, α = %.2f)", x$objetivo, x$alfa)),
+      tags$ul(tags$li(paste("Aumentos:", txt_sube)),
+              tags$li(paste("Caídas:", txt_baja))),
+      p(sprintf("Potencia ante el cambio observado (razón %.2f): %.2f.", x$RR, x$pot_obs)),
+      p(tags$small("La potencia ante el efecto observado se informa sólo como descripción:",
+        "no debe usarse para interpretar un resultado no significativo, porque es una",
+        "función del mismo valor de p (Hoenig y Heisey 2001). Lo informativo es el",
+        "efecto mínimo detectable.")))
+})
+```
+
+```{r plot-potencia}
+renderPlot({
+  req(!is.null(input$correr_potencia), input$correr_potencia > 0)
+  x <- potencia_res()
+  ggplot(x$curva, aes(RR, potencia)) +
+    geom_hline(yintercept = x$objetivo, linetype = 2, colour = "#A50021") +
+    geom_vline(xintercept = 1, linetype = 3, colour = "grey50") +
+    geom_line(colour = "grey30") + geom_point(size = 1.8) +
+    geom_vline(xintercept = x$RR, colour = "#1B7837") +
+    annotate("text", x = x$RR, y = 0.04, label = "observado", colour = "#1B7837",
+             angle = 90, hjust = 0, vjust = -0.4, size = 3.5) +
+    scale_x_log10(breaks = c(0.1, 0.25, 0.5, 1, 2, 4, 10)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    labs(x = "Razón de índices (B / A), escala logarítmica", y = "Potencia",
+         subtitle = paste0("Línea roja: potencia objetivo. ", x$n_sim,
+                           " simulaciones por punto"))
+}, height = 380)
+```
+
+```{r tabla-potencia}
+renderTable({
+  req(!is.null(input$correr_potencia), input$correr_potencia > 0)
+  potencia_res()$curva %>%
+    mutate(`cambio (%)` = 100*(RR - 1)) %>%
+    select(`razón` = RR, `cambio (%)`, potencia, `ajustes válidos` = ajustes)
+}, digits = 2)
+```
+
+La pregunta que importa cuando una prueba no resulta significativa es **qué magnitud de
+cambio habría podido detectarse**. Se estima por simulación: se generan conjuntos de datos
+con el mismo esfuerzo por cámara y la misma sobre-dispersión observada, bajo razones de
+índices conocidas, y se registra con qué frecuencia la prueba las declara significativas.
+Cuando el efecto mínimo detectable es mucho mayor que cualquier cambio biológicamente
+plausible, la comparación es **no informativa**: la conclusión correcta es que el diseño de
+dos puntos no alcanza, no que la actividad se mantuvo estable.
+
+# Detalle por cámara
+
+```{r tabla-camaras}
+renderDT({
+  grilla() %>%
+    select(Station, periodo, esfuerzo, ev, indice) %>%
+    pivot_wider(names_from = periodo, values_from = c(esfuerzo, ev, indice)) %>%
+    arrange(desc(coalesce(indice_B, 0) - coalesce(indice_A, 0))) %>%
+    rename(`cámara` = Station,
+           `días-cámara A` = esfuerzo_A, `eventos A` = ev_A, `índice A` = indice_A,
+           `días-cámara B` = esfuerzo_B, `eventos B` = ev_B, `índice B` = indice_B) %>%
+    datatable(rownames = FALSE, options = list(pageLength = 15, dom = "tip")) %>%
+    formatRound(columns = c("índice A", "índice B"), digits = 1)
+})
+```
+
+# Notas metodológicas
+
+- **El esfuerzo es el denominador y debe ser el efectivo.** Sale de la matriz de operación
+  de cámaras, que contempla las fechas de instalación y retiro y los intervalos de
+  inactividad por falla, agotamiento de baterías o robo.
+- **Los ceros son información.** La grilla parte del esfuerzo, de modo que una cámara
+  operativa sin registros entra como cero verdadero. Excluirlos sesgaría la comparación e
+  impediría detectar disminuciones.
+- **Pero un cero sólo cuenta si hubo observación.** La matriz de operación se recorta a
+  las estaciones y al lapso presentes en la tabla de registros, porque el esfuerzo que
+  queda fuera corresponde a cámaras o a fechas cuyas fotografías no fueron procesadas: no
+  son ceros, son ausencia de dato. Hay que tener en cuenta que el criterio usa el primer y
+  el último **evento**, que pueden ser posteriores y anteriores, respectivamente, al primer
+  y último día efectivamente procesado; si se procesaron días sin detecciones en los
+  extremos de la serie, esos ceros legítimos quedan fuera. El resumen de la sección Datos
+  informa cuánto se recortó en cada corrida.
+- **El índice mide actividad detectada**, no abundancia. Cambios en el equipamiento
+  —modelo de cámara, altura, orientación— o en el comportamiento de los animales se
+  confunden con cambios en el número de individuos.
+- **La composición de cámaras puede diferir entre períodos.** El *offset* corrige el
+  esfuerzo, pero no el hecho de que los sitios no sean los mismos; por eso se informa
+  cuántas cámaras son comunes a ambos períodos.
+- **Comparar el mismo mes de años distintos** deja la estacionalidad controlada por
+  diseño. Comparar meses distintos mezcla cambio temporal con estacionalidad, y el
+  documento lo advierte.
